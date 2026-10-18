@@ -1,0 +1,21 @@
+{
+  "name": "safecheck-scan",
+  "version": "2.0.0",
+  "private": true,
+  "description": "SafeCheck - Token Safety Scanner for Robinhood Chain, BNB Chain, Ethereum and Base",
+  "scripts": {
+    "dev": "python dev_server.py",
+    "start": "python dev_server.py"
+  },
+  "keywords": [
+    "safecheck",
+    "token-scanner",
+    "security",
+    "ethereum",
+    "base",
+    "bsc",
+    "robinhood"
+  ],
+  "author": "",
+  "license": "MIT"
+}
