@@ -181,6 +181,7 @@ export default async function handler(req, res) {
     );
   }
 
+  let blockscoutScResult = null;
   if (selectedChain === 'robinhood' && currentCfg.blockscout) {
     securityPromises.push(
       fetchWithTimeout(`${currentCfg.blockscout}/tokens/${caLower}`, {
@@ -189,6 +190,14 @@ export default async function handler(req, res) {
         .then(r => r && r.ok ? r.json() : null)
         .then(data => {
           blockscoutResult = data;
+        })
+        .catch(() => {}),
+      fetchWithTimeout(`${currentCfg.blockscout}/smart-contracts/${caLower}`, {
+        headers: { 'User-Agent': 'Mozilla/5.0' }
+      }, 7000)
+        .then(r => r && r.ok ? r.json() : null)
+        .then(data => {
+          blockscoutScResult = data;
         })
         .catch(() => {})
     );
@@ -255,11 +264,15 @@ export default async function handler(req, res) {
 
   const isOpenSource = honeypotResult?.contractCode?.openSource != null
     ? honeypotResult.contractCode.openSource
-    : (goPlusResult?.is_open_source != null ? goPlusResult.is_open_source === '1' : null);
+    : (goPlusResult?.is_open_source != null
+      ? goPlusResult.is_open_source === '1'
+      : (blockscoutScResult?.is_verified != null ? blockscoutScResult.is_verified : null));
 
   const isProxy = honeypotResult?.contractCode?.isProxy != null
     ? honeypotResult.contractCode.isProxy
-    : (goPlusResult?.is_proxy != null ? goPlusResult.is_proxy === '1' : false);
+    : (goPlusResult?.is_proxy != null
+      ? goPlusResult.is_proxy === '1'
+      : (blockscoutScResult?.is_proxy || false));
 
   const isMintable = goPlusResult?.is_mintable != null ? goPlusResult.is_mintable === '1' : null;
 
@@ -281,36 +294,145 @@ export default async function handler(req, res) {
     : (honeypotResult?.token?.totalHolders ? parseInt(honeypotResult.token.totalHolders, 10) : null);
 
   // Top holders parsing
-  const rawHolders = goPlusResult?.holders || [];
+  let rawHolders = goPlusResult?.holders || [];
   let top10Pct = 0;
   let burnPct = 0;
+  let holderList = [];
 
-  const holderList = rawHolders.slice(0, 10).map((h, idx) => {
-    const pct = parseFloat(h.percent || 0) * 100;
-    const addr = (h.address || '').toLowerCase();
-    top10Pct += pct;
+  // If on Robinhood Chain, fetch live holders & burn from RPC
+  if (selectedChain === 'robinhood' && (!rawHolders || rawHolders.length === 0)) {
+    try {
+      const rpcBatch = [
+        { jsonrpc: '2.0', id: 1, method: 'eth_call', params: [{ to: caLower, data: '0x18160ddd' }, 'latest'] },
+        { jsonrpc: '2.0', id: 2, method: 'eth_call', params: [{ to: caLower, data: '0x70a08231000000000000000000000000000000000000000000000000000000000000dead' }, 'latest'] },
+        { jsonrpc: '2.0', id: 3, method: 'eth_call', params: [{ to: caLower, data: '0x70a082310000000000000000000000000000000000000000000000000000000000000000' }, 'latest'] },
+        { jsonrpc: '2.0', id: 4, method: 'eth_blockNumber', params: [] }
+      ];
 
-    let label = 'eoa';
-    if (DEAD_ADDRS.has(addr)) {
-      label = 'burn';
-      burnPct += pct;
-    } else if (h.is_locked) {
-      label = 'locker';
-    } else if (addr === (goPlusResult?.creator_address || '').toLowerCase()) {
-      label = 'creator';
-    } else if (h.is_contract === 1) {
-      label = 'contract';
-    }
+      const rpcRes = await fetchWithTimeout(currentCfg.rpc, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'User-Agent': 'Mozilla/5.0' },
+        body: JSON.stringify(rpcBatch)
+      }, 3000).then(r => r && r.ok ? r.json() : null).catch(() => null);
 
-    return {
-      addr: h.address,
-      pct,
-      label,
-      name: h.tag || null,
-      delegate: null,
-      isContract: h.is_contract === 1
-    };
-  });
+      if (Array.isArray(rpcRes) && rpcRes.length >= 4) {
+        const tsHex = rpcRes.find(r => r.id === 1)?.result || '0x0';
+        const deadHex = rpcRes.find(r => r.id === 2)?.result || '0x0';
+        const zeroHex = rpcRes.find(r => r.id === 3)?.result || '0x0';
+        const blockHex = rpcRes.find(r => r.id === 4)?.result || '0x0';
+
+        const ts = BigInt(tsHex && tsHex !== '0x' ? tsHex : '0');
+        const deadBal = BigInt(deadHex && deadHex !== '0x' ? deadHex : '0');
+        const zeroBal = BigInt(zeroHex && zeroHex !== '0x' ? zeroHex : '0');
+        const totalBurn = deadBal + zeroBal;
+        const blockNum = parseInt(blockHex, 16) || 0;
+
+        if (ts > 0n) {
+          burnPct = Number(totalBurn * 10000n / ts) / 100;
+
+          const fromBlock = '0x' + Math.max(0, blockNum - 2000).toString(16);
+          const logsRes = await fetchWithTimeout(currentCfg.rpc, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', 'User-Agent': 'Mozilla/5.0' },
+            body: JSON.stringify({
+              jsonrpc: '2.0', id: 5, method: 'eth_getLogs',
+              params: [{
+                address: caLower,
+                fromBlock,
+                toBlock: 'latest',
+                topics: ['0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef']
+              }]
+            })
+          }, 3000).then(r => r && r.ok ? r.json() : null).catch(() => null);
+
+          const candidateAddrs = new Set();
+          if (deadBal > 0n) candidateAddrs.add('0x000000000000000000000000000000000000dead');
+          if (zeroBal > 0n) candidateAddrs.add('0x0000000000000000000000000000000000000000');
+
+          (market.pools || []).forEach(p => {
+            if (p.address && /^0x[a-fA-F0-9]{40}$/.test(p.address)) candidateAddrs.add(p.address.toLowerCase());
+          });
+
+          const logs = logsRes?.result || [];
+          for (const l of logs) {
+            const topics = l.topics || [];
+            if (topics.length >= 3) {
+              candidateAddrs.add('0x' + topics[1].slice(-40).toLowerCase());
+              candidateAddrs.add('0x' + topics[2].slice(-40).toLowerCase());
+            }
+          }
+
+          const candList = Array.from(candidateAddrs).slice(0, 40);
+          if (candList.length > 0) {
+            const balBatch = candList.map((a, i) => ({
+              jsonrpc: '2.0', id: i, method: 'eth_call',
+              params: [{ to: caLower, data: '0x70a08231' + a.slice(2).padStart(64, '0') }, 'latest']
+            }));
+
+            const balRes = await fetchWithTimeout(currentCfg.rpc, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json', 'User-Agent': 'Mozilla/5.0' },
+              body: JSON.stringify(balBatch)
+            }, 3000).then(r => r && r.ok ? r.json() : null).catch(() => null);
+
+            if (Array.isArray(balRes)) {
+              const poolAddrs = new Set((market.pools || []).map(p => (p.address || '').toLowerCase()));
+              const parsed = [];
+              for (const br of balRes) {
+                const a = candList[br.id];
+                const bHex = br.result || '0x0';
+                const bal = BigInt(bHex && bHex !== '0x' ? bHex : '0');
+                if (bal > 0n) {
+                  const pct = Number(bal * 10000n / ts) / 100;
+                  let label = 'eoa';
+                  if (DEAD_ADDRS.has(a)) label = 'burn';
+                  else if (poolAddrs.has(a)) label = 'pool';
+                  parsed.push({
+                    addr: a,
+                    pct,
+                    label,
+                    name: null,
+                    delegate: null,
+                    isContract: label === 'pool'
+                  });
+                }
+              }
+              parsed.sort((x, y) => y.pct - x.pct);
+              holderList = parsed.slice(0, 10);
+              top10Pct = holderList.reduce((acc, h) => acc + h.pct, 0);
+            }
+          }
+        }
+      }
+    } catch (err) {}
+  } else if (rawHolders.length > 0) {
+    holderList = rawHolders.slice(0, 10).map((h) => {
+      const pct = parseFloat(h.percent || 0) * 100;
+      const addr = (h.address || '').toLowerCase();
+      top10Pct += pct;
+
+      let label = 'eoa';
+      if (DEAD_ADDRS.has(addr)) {
+        label = 'burn';
+        burnPct += pct;
+      } else if (h.is_locked) {
+        label = 'locker';
+      } else if (addr === (goPlusResult?.creator_address || '').toLowerCase()) {
+        label = 'creator';
+      } else if (h.is_contract === 1) {
+        label = 'contract';
+      }
+
+      return {
+        addr: h.address,
+        pct,
+        label,
+        name: h.tag || null,
+        delegate: null,
+        isContract: h.is_contract === 1
+      };
+    });
+  }
 
   const security = {
     name: tokenName,
@@ -351,7 +473,7 @@ export default async function handler(req, res) {
       openSource: isOpenSource,
       isProxy
     } : null,
-    contractName: tokenName,
+    contractName: blockscoutScResult?.name || tokenName,
     lpOnchain,
     ownerStatus,
     owner: ownerAddr,
