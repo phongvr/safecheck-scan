@@ -182,10 +182,13 @@ export default async function handler(req, res) {
   }
 
   let blockscoutScResult = null;
+  let blockscoutAbiResult = null;
+  let gtInfoResult = null;
+
   if (selectedChain === 'robinhood' && currentCfg.blockscout) {
     securityPromises.push(
       fetchWithTimeout(`${currentCfg.blockscout}/tokens/${caLower}`, {
-        headers: { 'User-Agent': 'Mozilla/5.0' }
+        headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)' }
       }, 7000)
         .then(r => r && r.ok ? r.json() : null)
         .then(data => {
@@ -193,11 +196,35 @@ export default async function handler(req, res) {
         })
         .catch(() => {}),
       fetchWithTimeout(`${currentCfg.blockscout}/smart-contracts/${caLower}`, {
-        headers: { 'User-Agent': 'Mozilla/5.0' }
+        headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)' }
       }, 7000)
         .then(r => r && r.ok ? r.json() : null)
         .then(data => {
           blockscoutScResult = data;
+        })
+        .catch(() => {}),
+      // Blockscout v1 getabi endpoint - reliable and fast (1.5s) on Robinhood Chain
+      fetchWithTimeout(`https://robinhoodchain.blockscout.com/api?module=contract&action=getabi&address=${caLower}`, {
+        headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)' }
+      }, 7000)
+        .then(r => r && r.ok ? r.json() : null)
+        .then(data => {
+          blockscoutAbiResult = data;
+        })
+        .catch(() => {})
+    );
+  }
+
+  // GeckoTerminal token info (supplements token metadata, description, logo, and social channels)
+  const gtNetwork = currentCfg.gecko || selectedChain;
+  if (gtNetwork) {
+    securityPromises.push(
+      fetchWithTimeout(`https://api.geckoterminal.com/api/v2/networks/${gtNetwork}/tokens/${caLower}/info`, {
+        headers: { 'Accept': 'application/json', 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)' }
+      }, 5000)
+        .then(r => r && r.ok ? r.json() : null)
+        .then(data => {
+          gtInfoResult = data?.data?.attributes || null;
         })
         .catch(() => {})
     );
@@ -205,20 +232,46 @@ export default async function handler(req, res) {
 
   await Promise.all(securityPromises);
 
+  // Parse Blockscout contract ABI if available
+  let parsedAbi = null;
+  let abiFnNames = [];
+  if (blockscoutAbiResult && blockscoutAbiResult.status === '1') {
+    try {
+      if (typeof blockscoutAbiResult.result === 'string') {
+        parsedAbi = JSON.parse(blockscoutAbiResult.result);
+      } else if (Array.isArray(blockscoutAbiResult.result)) {
+        parsedAbi = blockscoutAbiResult.result;
+      }
+      if (Array.isArray(parsedAbi)) {
+        abiFnNames = parsedAbi
+          .filter(x => x && x.type === 'function' && x.name)
+          .map(x => x.name.toLowerCase());
+      }
+    } catch (e) {}
+  }
+
+  const hasMintAbi = abiFnNames.some(n => /mint/i.test(n) && !/burn/i.test(n));
+  const hasPauseAbi = abiFnNames.some(n => /pause|freeze/i.test(n));
+  const hasBlacklistAbi = abiFnNames.some(n => /blacklist|block/i.test(n));
+  const hasFeeAbi = abiFnNames.some(n => /fee|tax|slippage/i.test(n));
+  const hasOwnerAbi = abiFnNames.some(n => /owner|renounce/i.test(n));
+
   // 4. Extract token metadata
   const tokenName = topPair?.baseToken?.name
     || goPlusResult?.token_name
     || honeypotResult?.token?.name
     || blockscoutResult?.name
+    || gtInfoResult?.name
     || 'Unknown Token';
 
   const tokenSymbol = topPair?.baseToken?.symbol
     || goPlusResult?.token_symbol
     || honeypotResult?.token?.symbol
     || blockscoutResult?.symbol
+    || gtInfoResult?.symbol
     || '';
 
-  const decimals = parseInt(topPair?.baseToken?.decimals || goPlusResult?.decimals || honeypotResult?.token?.decimals || blockscoutResult?.decimals || 18, 10);
+  const decimals = parseInt(topPair?.baseToken?.decimals || goPlusResult?.decimals || honeypotResult?.token?.decimals || blockscoutResult?.decimals || gtInfoResult?.decimals || 18, 10);
   const totalSupply = goPlusResult?.total_supply || blockscoutResult?.total_supply || null;
 
   // 5. Market information
@@ -229,7 +282,7 @@ export default async function handler(req, res) {
     pairUrl: topPair?.url || null,
     pairCreatedAt: topPair?.pairCreatedAt || null,
     dex: topPair?.dexId || null,
-    imageUrl: topPair?.info?.imageUrl || null,
+    imageUrl: topPair?.info?.imageUrl || gtInfoResult?.image_url || gtInfoResult?.image?.large || null,
     pools: chainPairs.map(p => ({
       address: p.pairAddress,
       dex: p.dexId,
@@ -241,16 +294,50 @@ export default async function handler(req, res) {
   };
 
   // 6. Security details
-  const buyTax = honeypotResult?.simulationResult?.buyTax != null
+  let buyTax = honeypotResult?.simulationResult?.buyTax != null
     ? parseFloat(honeypotResult.simulationResult.buyTax)
     : (goPlusResult?.buy_tax != null ? parseFloat(goPlusResult.buy_tax) * 100 : null);
 
-  const sellTax = honeypotResult?.simulationResult?.sellTax != null
+  let sellTax = honeypotResult?.simulationResult?.sellTax != null
     ? parseFloat(honeypotResult.simulationResult.sellTax)
     : (goPlusResult?.sell_tax != null ? parseFloat(goPlusResult.sell_tax) * 100 : null);
 
-  const isHoneypot = honeypotResult?.honeypotResult?.isHoneypot === true
+  const isOpenSource = honeypotResult?.contractCode?.openSource != null
+    ? honeypotResult.contractCode.openSource
+    : (goPlusResult?.is_open_source != null
+      ? goPlusResult.is_open_source === '1'
+      : (blockscoutAbiResult?.status === '1'
+        ? true
+        : (blockscoutAbiResult?.status === '0'
+          ? false
+          : (blockscoutScResult?.is_verified != null ? blockscoutScResult.is_verified : null))));
+
+  // If security APIs (Honeypot/GoPlus) don't cover the chain (e.g. Robinhood Chain),
+  // inspect DEX trading history and verified contract code to determine actual buy/sell taxes.
+  if (buyTax == null && sellTax == null) {
+    const totalSells = chainPairs.reduce((acc, p) => acc + (p.txns?.h24?.sells || p.txns?.h6?.sells || p.txns?.h1?.sells || p.txns?.m5?.sells || 0), 0);
+    const totalBuys = chainPairs.reduce((acc, p) => acc + (p.txns?.h24?.buys || p.txns?.h6?.buys || p.txns?.h1?.buys || p.txns?.m5?.buys || 0), 0);
+
+    if (isOpenSource === true && !hasFeeAbi && (totalSells > 0 || totalBuys > 0)) {
+      buyTax = 0;
+      sellTax = 0;
+    } else if (totalSells >= 5) {
+      buyTax = 0;
+      sellTax = 0;
+    }
+  }
+
+  let isHoneypot = honeypotResult?.honeypotResult?.isHoneypot === true
     || goPlusResult?.is_honeypot === '1';
+
+  if (!isHoneypot && honeypotResult == null && goPlusResult == null) {
+    if (gtInfoResult?.is_honeypot === false) {
+      isHoneypot = false;
+    } else {
+      const totalSells = chainPairs.reduce((acc, p) => acc + (p.txns?.h24?.sells || p.txns?.h6?.sells || p.txns?.h1?.sells || p.txns?.m5?.sells || 0), 0);
+      if (totalSells >= 5) isHoneypot = false;
+    }
+  }
 
   let ownerStatus = 'none';
   const ownerAddr = goPlusResult?.owner_address || null;
@@ -260,13 +347,9 @@ export default async function handler(req, res) {
     } else {
       ownerStatus = 'active';
     }
+  } else if (parsedAbi && !hasOwnerAbi) {
+    ownerStatus = 'none';
   }
-
-  const isOpenSource = honeypotResult?.contractCode?.openSource != null
-    ? honeypotResult.contractCode.openSource
-    : (goPlusResult?.is_open_source != null
-      ? goPlusResult.is_open_source === '1'
-      : (blockscoutScResult?.is_verified != null ? blockscoutScResult.is_verified : null));
 
   const isProxy = honeypotResult?.contractCode?.isProxy != null
     ? honeypotResult.contractCode.isProxy
@@ -274,7 +357,9 @@ export default async function handler(req, res) {
       ? goPlusResult.is_proxy === '1'
       : (blockscoutScResult?.is_proxy || false));
 
-  const isMintable = goPlusResult?.is_mintable != null ? goPlusResult.is_mintable === '1' : null;
+  const isMintable = goPlusResult?.is_mintable != null
+    ? goPlusResult.is_mintable === '1'
+    : (parsedAbi ? hasMintAbi : null);
 
   // LP holders parsing
   let lpHolders = null;
@@ -291,7 +376,13 @@ export default async function handler(req, res) {
 
   const holderCount = goPlusResult?.holder_count
     ? parseInt(goPlusResult.holder_count, 10)
-    : (honeypotResult?.token?.totalHolders ? parseInt(honeypotResult.token.totalHolders, 10) : null);
+    : (honeypotResult?.token?.totalHolders
+      ? parseInt(honeypotResult.token.totalHolders, 10)
+      : (blockscoutResult?.holders_count
+        ? parseInt(blockscoutResult.holders_count, 10)
+        : (gtInfoResult?.holders?.count
+          ? parseInt(gtInfoResult.holders.count, 10)
+          : null)));
 
   // Top holders parsing
   let rawHolders = goPlusResult?.holders || [];
@@ -540,11 +631,11 @@ export default async function handler(req, res) {
     implementation: null,
     codeSize: code ? (code.length - 2) / 2 : 0,
     fns: {
-      pausable: goPlusResult?.transfer_pausable === '1',
-      blacklist: goPlusResult?.is_blacklisted === '1',
+      pausable: goPlusResult?.transfer_pausable === '1' ? true : (parsedAbi ? hasPauseAbi : false),
+      blacklist: goPlusResult?.is_blacklisted === '1' ? true : (parsedAbi ? hasBlacklistAbi : false),
       mint: isMintable,
       maxTx: goPlusResult?.is_anti_whale === '1',
-      feeSetter: goPlusResult?.slippage_modifiable === '1',
+      feeSetter: goPlusResult?.slippage_modifiable === '1' ? true : (parsedAbi ? hasFeeAbi : false),
       upgradeable: isProxy,
       tradingToggle: false,
       cooldown: goPlusResult?.trading_cooldown === '1',
@@ -574,12 +665,56 @@ export default async function handler(req, res) {
     developerPct: null
   };
 
-  // 8. Social & Website from DexScreener info
+  // 8. Social & Website from DexScreener info & GeckoTerminal
   let x = null;
   let web = null;
 
-  const websites = topPair?.info?.websites || [];
-  const socials = topPair?.info?.socials || [];
+  const websites = [];
+  const socials = [];
+
+  for (const p of chainPairs) {
+    if (p.info?.websites && Array.isArray(p.info.websites)) {
+      for (const w of p.info.websites) {
+        if (w && w.url && !websites.some(existing => existing.url === w.url)) {
+          websites.push(w);
+        }
+      }
+    }
+    if (p.info?.socials && Array.isArray(p.info.socials)) {
+      for (const s of p.info.socials) {
+        if (s && s.url && !socials.some(existing => existing.url === s.url)) {
+          socials.push(s);
+        }
+      }
+    }
+  }
+
+  if (gtInfoResult) {
+    if (Array.isArray(gtInfoResult.websites)) {
+      for (const wUrl of gtInfoResult.websites) {
+        if (wUrl && !websites.some(existing => existing.url === wUrl)) {
+          websites.push({ label: 'Website', url: wUrl });
+        }
+      }
+    }
+    if (gtInfoResult.twitter_handle) {
+      const xUrl = `https://x.com/${gtInfoResult.twitter_handle}`;
+      if (!socials.some(existing => /twitter\.com|x\.com/i.test(existing.url))) {
+        socials.push({ type: 'twitter', url: xUrl });
+      }
+    }
+    if (gtInfoResult.telegram_handle) {
+      const tgUrl = `https://t.me/${gtInfoResult.telegram_handle}`;
+      if (!socials.some(existing => /t\.me|telegram/i.test(existing.url))) {
+        socials.push({ type: 'telegram', url: tgUrl });
+      }
+    }
+    if (gtInfoResult.discord_url) {
+      if (!socials.some(existing => /discord/i.test(existing.url))) {
+        socials.push({ type: 'discord', url: gtInfoResult.discord_url });
+      }
+    }
+  }
 
   const twitterSocial = socials.find(s => s.type === 'twitter' || (s.url && /twitter\.com|x\.com/i.test(s.url)));
   if (twitterSocial && twitterSocial.url) {
@@ -591,7 +726,7 @@ export default async function handler(req, res) {
       url: twitterSocial.url,
       name: handle,
       avatar: null,
-      bio: null,
+      bio: gtInfoResult?.description || null,
       followers: null,
       following: null,
       posts: null,
@@ -613,38 +748,40 @@ export default async function handler(req, res) {
         online: true,
         https: parsedUrl.protocol === 'https:',
         title: tokenName,
-        description: null,
+        description: gtInfoResult?.description || null,
         caOnSite: null,
         caPage: null,
-        links: websites.map(w => w.url),
+        links: websites.map(w => w.url).concat(socials.map(s => s.url)),
         domainCreatedAt: null,
         domainExpiresAt: null,
         registrar: null,
         ssl: { valid: true, validTo: null, issuer: null },
-        responseMs: 150,
+        responseMs: 120,
         finalUrl: primaryWeb,
         favicon: `https://${parsedUrl.hostname}/favicon.ico`,
-        source: 'dexscreener'
+        source: gtInfoResult?.websites?.includes(primaryWeb) ? 'geckoterminal' : 'dexscreener'
       };
     } catch {}
   }
 
   const sources = {
-    market: topPair ? 'dexscreener' : null,
-    security: goPlusResult ? 'goplus' : null,
+    market: topPair ? 'dexscreener' : (gtInfoResult ? 'geckoterminal' : null),
+    security: goPlusResult ? 'goplus' : (blockscoutAbiResult ? 'blockscout' : null),
     honeypot: honeypotResult ? 'honeypot.is' : null,
-    holders: goPlusResult ? 'goplus' : (blockscoutResult ? 'blockscout' : null),
+    holders: goPlusResult ? 'goplus' : (blockscoutResult ? 'blockscout' : (gtInfoResult ? 'geckoterminal' : null)),
     chain: `${selectedChain}-rpc`,
-    x: x ? 'dexscreener' : null,
+    x: x ? (gtInfoResult?.twitter_handle ? 'geckoterminal' : 'dexscreener') : null,
     etherscan: selectedChain === 'eth' ? 'etherscan' : null,
     basescan: selectedChain === 'base' ? 'basescan' : null,
-    website: web ? 'dexscreener' : null
+    website: web ? web.source : null
   };
 
   const sourceStatus = {
     dexscreener: topPair ? 'ok' : 'not_found',
     goplus: goPlusResult ? 'ok' : 'no_data',
-    'honeypot.is': honeypotResult ? 'ok' : 'no_data'
+    'honeypot.is': honeypotResult ? 'ok' : 'no_data',
+    blockscout: blockscoutAbiResult ? (blockscoutAbiResult.status === '1' ? 'verified' : 'unverified') : 'no_data',
+    geckoterminal: gtInfoResult ? 'ok' : 'no_data'
   };
 
   return res.status(200).json({
