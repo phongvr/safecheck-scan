@@ -377,6 +377,14 @@ export default async function handler(req, res) {
 
             if (Array.isArray(balRes)) {
               const poolAddrs = new Set((market.pools || []).map(p => (p.address || '').toLowerCase()));
+              const poolNames = {};
+              (market.pools || []).forEach(p => {
+                if (p.address) {
+                  const dexName = p.dex ? (p.dex.charAt(0).toUpperCase() + p.dex.slice(1)) : 'DEX';
+                  poolNames[p.address.toLowerCase()] = dexName + ' Pool';
+                }
+              });
+
               const parsed = [];
               for (const br of balRes) {
                 const a = candList[br.id];
@@ -385,13 +393,18 @@ export default async function handler(req, res) {
                 if (bal > 0n) {
                   const pct = Number(bal * 10000n / ts) / 100;
                   let label = 'eoa';
-                  if (DEAD_ADDRS.has(a)) label = 'burn';
-                  else if (poolAddrs.has(a)) label = 'pool';
+                  let name = null;
+                  if (DEAD_ADDRS.has(a)) {
+                    label = 'burn';
+                  } else if (poolAddrs.has(a)) {
+                    label = 'pool';
+                    name = poolNames[a] || 'Pool';
+                  }
                   parsed.push({
                     addr: a,
                     pct,
                     label,
-                    name: null,
+                    name,
                     delegate: null,
                     isContract: label === 'pool'
                   });
@@ -399,7 +412,54 @@ export default async function handler(req, res) {
               }
               parsed.sort((x, y) => y.pct - x.pct);
               holderList = parsed.slice(0, 10);
+
+              // Check bytecode for non-dead holders to identify contracts
+              const checkAddrs = holderList.filter(h => h.label !== 'burn');
+              if (checkAddrs.length > 0) {
+                const codeBatch = checkAddrs.map((h, i) => ({
+                  jsonrpc: '2.0', id: i, method: 'eth_getCode', params: [h.addr, 'latest']
+                }));
+                const codeRes = await fetchWithTimeout(currentCfg.rpc, {
+                  method: 'POST',
+                  headers: { 'Content-Type': 'application/json', 'User-Agent': 'Mozilla/5.0' },
+                  body: JSON.stringify(codeBatch)
+                }, 2500).then(r => r && r.ok ? r.json() : null).catch(() => null);
+
+                if (Array.isArray(codeRes)) {
+                  for (const cr of codeRes) {
+                    const h = checkAddrs[cr.id];
+                    if (h) {
+                      const code = cr.result || '0x';
+                      const isContract = code && code !== '0x' && code !== '0x0' && code.length > 4;
+                      if (isContract) {
+                        h.isContract = true;
+                        if (h.label === 'eoa') {
+                          h.label = 'contract';
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+
+              const creatorLower = (goPlusResult?.creator_address || '').toLowerCase();
+              const ownerLower = (goPlusResult?.owner_address || '').toLowerCase();
+              holderList.forEach(h => {
+                const addrLower = h.addr.toLowerCase();
+                if (h.label !== 'burn' && h.label !== 'pool') {
+                  if (creatorLower && addrLower === creatorLower) {
+                    h.label = 'creator';
+                    h.name = 'Creator / Dev';
+                  } else if (ownerLower && addrLower === ownerLower) {
+                    h.label = 'creator';
+                    h.name = 'Owner';
+                  }
+                }
+              });
+
               top10Pct = holderList.reduce((acc, h) => acc + h.pct, 0);
+              const burnSum = holderList.filter(h => h.label === 'burn').reduce((acc, h) => acc + h.pct, 0);
+              if (burnPct == null || burnSum > burnPct) burnPct = burnSum;
             }
           }
         }
