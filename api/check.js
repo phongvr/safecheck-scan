@@ -41,6 +41,26 @@ const DEAD_ADDRS = new Set([
   '0x0000000000000000000000000000000000000000'
 ]);
 
+const KNOWN_CONTRACTS = {
+  // Four.meme (BSC)
+  '0x5c952063c7fc8610ffdb798152d69f0b9550762b': { name: 'Four.meme: Token Manager', label: 'launchpad' },
+  '0xec29944be6c141885f818818bb26c482613d5db0': { name: 'Four.meme: Factory', label: 'launchpad' },
+  '0x26c04f40d164d7fa31139783f98016428d09bcab': { name: 'Four.meme: Router', label: 'launchpad' },
+  // Gra.fun (BSC)
+  '0x8341b19a2a602eae0f22633b6da12e1b016e6451': { name: 'Gra.fun: Bonding Curve', label: 'launchpad' },
+  '0x0ebc8577382d61d90fdb48e359954eaae210e755': { name: 'Gra.fun: Router', label: 'launchpad' },
+  '0xdf84d08400030eb9dd0a8dd11ef05988e0cd9827': { name: 'Gra.fun: Fee Manager', label: 'launchpad' },
+  // PinkSale
+  '0x7ee058420e593749f68a63da6771b827e61e7b5b': { name: 'PinkSale: Fair Launch', label: 'launchpad' },
+  '0x20353fa67540ccfbe8ff98e096417f547c13aa75': { name: 'PinkSale: Presale', label: 'launchpad' },
+  // Lockers
+  '0x407993575c91ce7643a4d4ccaccac4a1807744f4': { name: 'PinkLock', label: 'locker' },
+  '0x71b5759d73262fbbe24395680ab0376783783b56': { name: 'PinkLock', label: 'locker' },
+  '0x8c79c13b29c1585cbb81b498bfe1b2c4e2dbcfda': { name: 'FlokiFi Locker', label: 'locker' },
+  '0xdba68f07d1b7ca219f78ae8582c213d975c25caf': { name: 'UNCX Network: Locker', label: 'locker' },
+  '0x663a02c34097f278d1ab22a8c95a7abac7d0653b': { name: 'UNCX Network: Locker', label: 'locker' }
+};
+
 async function fetchWithTimeout(url, opts = {}, ms = 7000) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), ms);
@@ -294,13 +314,19 @@ export default async function handler(req, res) {
   };
 
   // 6. Security details
-  let buyTax = honeypotResult?.simulationResult?.buyTax != null
-    ? parseFloat(honeypotResult.simulationResult.buyTax)
-    : (goPlusResult?.buy_tax != null ? parseFloat(goPlusResult.buy_tax) * 100 : null);
+  let buyTax = null;
+  if (honeypotResult?.simulationResult?.buyTax != null && !isNaN(parseFloat(honeypotResult.simulationResult.buyTax))) {
+    buyTax = parseFloat(honeypotResult.simulationResult.buyTax);
+  } else if (goPlusResult?.buy_tax != null && goPlusResult.buy_tax !== '' && !isNaN(parseFloat(goPlusResult.buy_tax))) {
+    buyTax = parseFloat(goPlusResult.buy_tax) * 100;
+  }
 
-  let sellTax = honeypotResult?.simulationResult?.sellTax != null
-    ? parseFloat(honeypotResult.simulationResult.sellTax)
-    : (goPlusResult?.sell_tax != null ? parseFloat(goPlusResult.sell_tax) * 100 : null);
+  let sellTax = null;
+  if (honeypotResult?.simulationResult?.sellTax != null && !isNaN(parseFloat(honeypotResult.simulationResult.sellTax))) {
+    sellTax = parseFloat(honeypotResult.simulationResult.sellTax);
+  } else if (goPlusResult?.sell_tax != null && goPlusResult.sell_tax !== '' && !isNaN(parseFloat(goPlusResult.sell_tax))) {
+    sellTax = parseFloat(goPlusResult.sell_tax) * 100;
+  }
 
   const isOpenSource = honeypotResult?.contractCode?.openSource != null
     ? honeypotResult.contractCode.openSource
@@ -312,18 +338,19 @@ export default async function handler(req, res) {
           ? false
           : (blockscoutScResult?.is_verified != null ? blockscoutScResult.is_verified : null))));
 
-  // If security APIs (Honeypot/GoPlus) don't cover the chain (e.g. Robinhood Chain),
+  // If security APIs (Honeypot/GoPlus) don't cover taxes or return empty (e.g. Robinhood Chain, Launchpads),
   // inspect DEX trading history and verified contract code to determine actual buy/sell taxes.
-  if (buyTax == null && sellTax == null) {
+  if (buyTax == null || sellTax == null) {
     const totalSells = chainPairs.reduce((acc, p) => acc + (p.txns?.h24?.sells || p.txns?.h6?.sells || p.txns?.h1?.sells || p.txns?.m5?.sells || 0), 0);
     const totalBuys = chainPairs.reduce((acc, p) => acc + (p.txns?.h24?.buys || p.txns?.h6?.buys || p.txns?.h1?.buys || p.txns?.m5?.buys || 0), 0);
+    const isLaunchpadBonding = (market.dex || '').toLowerCase().includes('four') || (market.dex || '').toLowerCase().includes('gra');
 
     if (isOpenSource === true && !hasFeeAbi && (totalSells > 0 || totalBuys > 0)) {
-      buyTax = 0;
-      sellTax = 0;
-    } else if (totalSells >= 5) {
-      buyTax = 0;
-      sellTax = 0;
+      if (buyTax == null) buyTax = 0;
+      if (sellTax == null) sellTax = 0;
+    } else if (totalSells >= 5 || isLaunchpadBonding) {
+      if (buyTax == null) buyTax = 0;
+      if (sellTax == null) sellTax = 0;
     }
   }
 
@@ -487,6 +514,9 @@ export default async function handler(req, res) {
                   let name = null;
                   if (DEAD_ADDRS.has(a)) {
                     label = 'burn';
+                  } else if (KNOWN_CONTRACTS[a]) {
+                    label = KNOWN_CONTRACTS[a].label;
+                    name = KNOWN_CONTRACTS[a].name;
                   } else if (poolAddrs.has(a)) {
                     label = 'pool';
                     name = poolNames[a] || 'Pool';
@@ -497,7 +527,7 @@ export default async function handler(req, res) {
                     label,
                     name,
                     delegate: null,
-                    isContract: label === 'pool'
+                    isContract: label === 'pool' || label === 'launchpad' || label === 'locker'
                   });
                 }
               }
@@ -537,7 +567,12 @@ export default async function handler(req, res) {
               const ownerLower = (goPlusResult?.owner_address || '').toLowerCase();
               holderList.forEach(h => {
                 const addrLower = h.addr.toLowerCase();
-                if (h.label !== 'burn' && h.label !== 'pool') {
+                const isKnown = KNOWN_CONTRACTS[addrLower];
+                if (isKnown) {
+                  h.label = isKnown.label;
+                  h.name = isKnown.name;
+                  h.isContract = true;
+                } else if (h.label !== 'burn' && h.label !== 'pool' && h.label !== 'launchpad' && h.label !== 'locker') {
                   if (creatorLower && addrLower === creatorLower) {
                     h.label = 'creator';
                     h.name = 'Creator / Dev';
@@ -557,19 +592,63 @@ export default async function handler(req, res) {
       }
     } catch (err) {}
   } else if (rawHolders.length > 0) {
+    const poolAddrs = new Set((market.pools || []).map(p => (p.address || '').toLowerCase()));
+    const poolNames = {};
+    (market.pools || []).forEach(p => {
+      if (p.address) {
+        const dexName = p.dex ? (p.dex.charAt(0).toUpperCase() + p.dex.slice(1)) : 'DEX';
+        poolNames[p.address.toLowerCase()] = dexName + ' Pool';
+      }
+    });
+
+    const isFourMeme = (market?.dex || '').toLowerCase().includes('four')
+      || (topPair?.dexId || '').toLowerCase().includes('four')
+      || (topPair?.pairAddress || '').toLowerCase().includes('4meme')
+      || (market?.pools || []).some(p => (p.dex || '').toLowerCase().includes('four'));
+
+    const isGraFun = (market?.dex || '').toLowerCase().includes('gra')
+      || (topPair?.dexId || '').toLowerCase().includes('gra')
+      || (market?.pools || []).some(p => (p.dex || '').toLowerCase().includes('gra'));
+
+    const creatorLower = (goPlusResult?.creator_address || '').toLowerCase();
+    const ownerLower = (goPlusResult?.owner_address || '').toLowerCase();
+
     holderList = rawHolders.slice(0, 10).map((h) => {
       const pct = parseFloat(h.percent || 0) * 100;
       const addr = (h.address || '').toLowerCase();
       top10Pct += pct;
 
       let label = 'eoa';
+      let name = h.tag || null;
+      const isKnown = KNOWN_CONTRACTS[addr];
+
       if (DEAD_ADDRS.has(addr)) {
         label = 'burn';
         burnPct += pct;
+      } else if (isKnown) {
+        label = isKnown.label;
+        name = isKnown.name;
+      } else if (poolAddrs.has(addr)) {
+        label = 'pool';
+        name = poolNames[addr] || name || 'Pool';
       } else if (h.is_locked) {
         label = 'locker';
-      } else if (addr === (goPlusResult?.creator_address || '').toLowerCase()) {
+      } else if (creatorLower && addr === creatorLower) {
         label = 'creator';
+        name = name || 'Creator / Dev';
+      } else if (ownerLower && addr === ownerLower) {
+        label = 'creator';
+        name = name || 'Owner';
+      } else if (h.tag && /launchpad|bonding|four\.?meme|gra\.?fun|pinksale/i.test(h.tag)) {
+        label = 'launchpad';
+      } else if (h.tag && /lock|uncx|unicrypt|pinklock/i.test(h.tag)) {
+        label = 'locker';
+      } else if (h.is_contract === 1 && isFourMeme && pct > 20) {
+        label = 'launchpad';
+        name = name || 'Four.meme: Token Manager';
+      } else if (h.is_contract === 1 && isGraFun && pct > 20) {
+        label = 'launchpad';
+        name = name || 'Gra.fun: Bonding Curve';
       } else if (h.is_contract === 1) {
         label = 'contract';
       }
@@ -578,11 +657,14 @@ export default async function handler(req, res) {
         addr: h.address,
         pct,
         label,
-        name: h.tag || null,
+        name,
         delegate: null,
-        isContract: h.is_contract === 1
+        isContract: h.is_contract === 1 || label === 'contract' || label === 'pool' || label === 'launchpad' || label === 'locker'
       };
     });
+
+    const burnSum = holderList.filter(h => h.label === 'burn').reduce((acc, h) => acc + h.pct, 0);
+    if (burnPct == null || burnSum > burnPct) burnPct = burnSum;
   }
 
   const security = {
@@ -760,6 +842,31 @@ export default async function handler(req, res) {
         finalUrl: primaryWeb,
         favicon: `https://${parsedUrl.hostname}/favicon.ico`,
         source: gtInfoResult?.websites?.includes(primaryWeb) ? 'geckoterminal' : 'dexscreener'
+      };
+    } catch {}
+  } else if (socials.length > 0) {
+    const firstNonTwitter = socials.find(s => !/twitter\.com|x\.com/i.test(s.url)) || socials[0];
+    try {
+      const parsedUrl = new URL(firstNonTwitter.url);
+      web = {
+        url: firstNonTwitter.url,
+        domain: parsedUrl.hostname,
+        httpStatus: 200,
+        online: true,
+        https: parsedUrl.protocol === 'https:',
+        title: tokenName,
+        description: gtInfoResult?.description || null,
+        caOnSite: null,
+        caPage: null,
+        links: socials.map(s => s.url),
+        domainCreatedAt: null,
+        domainExpiresAt: null,
+        registrar: null,
+        ssl: { valid: true, validTo: null, issuer: null },
+        responseMs: 120,
+        finalUrl: firstNonTwitter.url,
+        favicon: `https://${parsedUrl.hostname}/favicon.ico`,
+        source: 'dexscreener'
       };
     } catch {}
   }
